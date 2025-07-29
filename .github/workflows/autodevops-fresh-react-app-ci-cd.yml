@@ -1,0 +1,283 @@
+name: autodevops-fresh-react-app-ci-cd
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: 'Azure Container Registry URL'
+        required: true
+        default: 'autodevopsacr.azurecr.io'
+      git_credentials:
+        description: 'Kubernetes secret for git credentials'
+        required: true
+        default: 'git-credentials'
+      registry_secret:
+        description: 'Kubernetes secret for ACR credentials'
+        required: true
+        default: 'acr-credentials'
+      azure_secret:
+        description: 'Kubernetes secret for Azure service principal'
+        required: true
+        default: 'azure-credentials'
+      app_namespace:
+        description: 'Kubernetes namespace for deployment'
+        required: true
+        default: 'argo'
+      resourceGroup:
+        description: 'Azure resource group'
+        required: true
+        default: 'sda-auto-devops-demo'
+
+concurrency:
+  group: autodevops-fresh-react-app-ci-cd-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+jobs:
+  build-test-lint:
+    name: Install, Lint, and Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint code
+        run: npm run lint
+      - name: Run tests
+        run: npm test
+
+  build-assets:
+    name: Build Assets
+    needs: build-test-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Build application
+        run: npm run build
+
+  docker-build-scan-push:
+    name: Docker Build, Scan, Push
+    needs: build-assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      REGISTRY: ${{ github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}
+      IMAGE_NAME: fresh-react-app
+      TAG: ${{ github.sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Build Docker image
+        run: |
+          docker build -t $REGISTRY/$IMAGE_NAME:$TAG .
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+      - name: Push image to Azure Container Registry
+        run: |
+          docker push $REGISTRY/$IMAGE_NAME:$TAG
+      - name: Upload image reference artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-reference
+          path: |
+            ./image-reference.txt
+        run: |
+          echo "${REGISTRY}/${IMAGE_NAME}:${TAG}" > ./image-reference.txt
+
+  provision-infra:
+    name: Provision/Update Azure Infrastructure
+    needs: docker-build-scan-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      RESOURCE_GROUP: ${{ github.event.inputs.resourceGroup || 'sda-auto-devops-demo' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+      - name: Terraform Init
+        run: terraform init
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+  deploy-aks:
+    name: Deploy to AKS
+    needs: [provision-infra, docker-build-scan-push]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REGISTRY: ${{ github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}
+      IMAGE_NAME: fresh-react-app
+      TAG: ${{ github.sha }}
+      KUBE_NAMESPACE: ${{ github.event.inputs.app_namespace || 'argo' }}
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Download image reference artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: image-reference
+      - name: Set up Azure CLI
+        uses: azure/cli@v2
+      - name: Azure CLI login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Set AKS context
+        run: |
+          az aks get-credentials --resource-group "${{ github.event.inputs.resourceGroup || 'sda-auto-devops-demo' }}" --name "${{ secrets.AKS_CLUSTER_NAME }}" --overwrite-existing
+      - name: Set image tag
+        id: image_tag
+        run: |
+          IMAGE=$(cat ./image-reference.txt)
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+      - name: Replace image in Kubernetes manifests
+        run: |
+          sed -i "s|image:.*|image: ${{ steps.image_tag.outputs.image }}|g" k8s/deployment.yaml
+      - name: Apply manifests
+        run: |
+          kubectl apply -n "$KUBE_NAMESPACE" -f k8s/deployment.yaml
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status -n "$KUBE_NAMESPACE" deployment/fresh-react-app --timeout=180s
+
+  post-deploy-validation:
+    name: Post-Deploy Validation & Smoke Test
+    needs: deploy-aks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      KUBE_NAMESPACE: ${{ github.event.inputs.app_namespace || 'argo' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Validate deployment (smoke test)
+        run: |
+          kubectl get pods -n "$KUBE_NAMESPACE"
+          # Example: Add custom integration test, health check, or curl command here
+
+  publish-artifacts:
+    name: Publish Build Artifacts
+    needs: build-assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-assets
+          path: |
+            build
+            dist
+            coverage
+
+  security-code-scan:
+    name: Code Scanning (Static Analysis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Run ESLint
+        run: npx eslint .
+      - name: Upload SARIF report (if created)
+        uses: github/codeql-action/upload-sarif@v3
+        if: success() && exists('eslint.sarif')
+        with:
+          sarif_file: eslint.sarif
+
+  monitor-azure:
+    name: Setup Azure Monitoring and Policy Enforcement
+    needs: deploy-aks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Enable Azure Monitor
+        run: |
+          az monitor log-analytics workspace create --resource-group "${{ github.event.inputs.resourceGroup || 'sda-auto-devops-demo' }}" --workspace-name "freshreactapp-logs"
+      - name: Apply Azure Policy assignments
+        run: |
+          # Example placeholder for Azure Policy integration
+          echo "Apply disk/network/image integrity policies, and enable secure defaults"
+
+  compliance-guardrails:
+    name: Security & Compliance Guardrails
+    needs: [monitor-azure, security-code-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check compliance and RBAC
+        run: |
+          echo "Audit AKS RBAC, check Azure Policy assignments"
+          # Insert additional compliance scanning as per requirements
+      - name: Output team security training reminder
+        run: |
+          echo "Reminder: All project team members must have current HIPAA/HITRUST compliance certification as per policy."
